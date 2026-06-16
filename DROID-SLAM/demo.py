@@ -16,7 +16,7 @@ from droid import Droid
 from droid_async import DroidAsync
 
 import torch.nn.functional as F
-
+from imu_prior import load_imu_prior_csv
 
 def show_image(image):
     image = image.permute(1, 2, 0).cpu().numpy()
@@ -81,7 +81,7 @@ if __name__ == '__main__':
     parser.add_argument("--imagedir", type=str, help="path to image directory")
     parser.add_argument("--calib", type=str, help="path to calibration file")
     parser.add_argument("--t0", default=0, type=int, help="starting frame")
-    parser.add_argument("--stride", default=3, type=int, help="frame stride")
+    parser.add_argument("--stride", default=1, type=int, help="frame stride")
 
     parser.add_argument("--weights", default="droid.pth")
     parser.add_argument("--buffer", type=int, default=512)
@@ -106,17 +106,30 @@ if __name__ == '__main__':
     parser.add_argument("--backend_device", type=str, default="cuda")
     
     parser.add_argument("--reconstruction_path", help="path to saved reconstruction")
+    parser.add_argument("--imu_prior", type=str, default=None, help="path to imu_prior.csv")
+
+    parser.add_argument("--imu_rotation_weight", type=float, default=1.0, help="weight for IMU rotation prior. 1.0 uses raw gyro integration.")
     args = parser.parse_args()
 
     args.stereo = False
     torch.multiprocessing.set_start_method('spawn')
 
+    
+    imu_priors = None
+
+    if args.imu_prior is not None:
+        imu_priors = load_imu_prior_csv(args.imu_prior)
+        print(f"[IMU] loaded imu priors: {len(imu_priors)} rows from {args.imu_prior}")
+        if len(imu_priors) > 0:
+            first_key = sorted(imu_priors.keys())[0]
+            print(f"[IMU] first prior frame_id={first_key}: {imu_priors[first_key]}")
+    
     droid = None
 
     # need high resolution depths
     if args.reconstruction_path is not None:
         args.upsample = True
-
+    
     tstamps = []
     for (t, image, intrinsics) in tqdm(image_stream(args.imagedir, args.calib, args.stride)):
         if t < args.t0:
@@ -129,7 +142,11 @@ if __name__ == '__main__':
             args.image_size = [image.shape[2], image.shape[3]]
             droid = DroidAsync(args) if args.asynchronous else Droid(args)
         
-        droid.track(t, image, intrinsics=intrinsics)
+        imu_prior = None
+        if imu_priors is not None:
+            imu_prior = imu_priors.get(int(t), None)
+
+        droid.track(t, image, intrinsics=intrinsics, imu_prior=imu_prior)
 
     traj_est = droid.terminate(image_stream(args.imagedir, args.calib, args.stride))
     
