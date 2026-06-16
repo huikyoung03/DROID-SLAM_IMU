@@ -1,0 +1,5 @@
+# ninja log v7
+0	21381	1781005103226828168	/home/ubuntu/DROID-SLAM-ORIGINAL/build/temp.linux-x86_64-cpython-38/src/droid.o	42723faa3b2cc9a6
+0	53969	1781005103226828168	/home/ubuntu/DROID-SLAM-ORIGINAL/build/temp.linux-x86_64-cpython-38/src/correlation_kernels.o	fd1d879166ce12a0
+0	54656	1781005103226828168	/home/ubuntu/DROID-SLAM-ORIGINAL/build/temp.linux-x86_64-cpython-38/src/altcorr_kernel.o	80794dad6ffb4528
+0	58378	1781005103226828168	/home/ubuntu/DROID-SLAM-ORIGINAL/build/temp.linux-x86_64-cpython-38/src/droid_kernels.o	5edae49ff7e00382
