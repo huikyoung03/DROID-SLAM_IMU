@@ -1,232 +1,254 @@
-import os
+from __future__ import annotations
+
 import argparse
-import numpy as np
-import pandas as pd
+import csv
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 
-def load_csv(session_dir):
-    timestamps_path = os.path.join(session_dir, "timestamps.csv")
-    imu_path = os.path.join(session_dir, "imu.csv")
-
-    if not os.path.exists(timestamps_path):
-        raise FileNotFoundError(f"timestamps.csv not found: {timestamps_path}")
-
-    if not os.path.exists(imu_path):
-        raise FileNotFoundError(f"imu.csv not found: {imu_path}")
-
-    frames = pd.read_csv(timestamps_path)
-    imu = pd.read_csv(imu_path)
-
-    required_frame_cols = {"frame_id", "timestamp_sec", "filename"}
-    required_imu_cols = {
-        "timestamp_sec",
-        "acc_x", "acc_y", "acc_z",
-        "gyro_x", "gyro_y", "gyro_z"
-    }
-
-    if not required_frame_cols.issubset(frames.columns):
-        raise ValueError(f"timestamps.csv columns invalid: {frames.columns.tolist()}")
-
-    if not required_imu_cols.issubset(imu.columns):
-        raise ValueError(f"imu.csv columns invalid: {imu.columns.tolist()}")
-
-    frames = frames.sort_values("timestamp_sec").reset_index(drop=True)
-    imu = imu.sort_values("timestamp_sec").reset_index(drop=True)
-
-    return frames, imu
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        out = float(value)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return out
+    except Exception:
+        return default
 
 
-def clean_imu(imu):
-    imu = imu.copy()
-
-    numeric_cols = [
-        "timestamp_sec",
-        "acc_x", "acc_y", "acc_z",
-        "gyro_x", "gyro_y", "gyro_z"
-    ]
-
-    for col in numeric_cols:
-        imu[col] = pd.to_numeric(imu[col], errors="coerce")
-
-    imu = imu.dropna(subset=numeric_cols)
-    imu = imu.drop_duplicates(subset=["timestamp_sec"])
-    imu = imu.sort_values("timestamp_sec").reset_index(drop=True)
-
-    # 비정상적으로 큰 값 제거
-    # 스마트폰 IMU 기준으로 넉넉하게 둔 필터
-    acc_norm = np.sqrt(imu["acc_x"]**2 + imu["acc_y"]**2 + imu["acc_z"]**2)
-    gyro_norm = np.sqrt(imu["gyro_x"]**2 + imu["gyro_y"]**2 + imu["gyro_z"]**2)
-
-    imu = imu[(acc_norm < 100.0) & (gyro_norm < 50.0)].reset_index(drop=True)
-
-    return imu
-
-
-def integrate_segment(segment):
+def convert_gyro_device_to_camera(gx: float, gy: float, gz: float) -> Tuple[float, float, float]:
     """
-    frame i-1 ~ frame i 사이의 IMU 데이터를 사전적분한다.
+    Android device gyro -> camera 좌표계 변환 위치.
 
-    현재 단계에서는 DROID-SLAM에 직접 넣지 않고,
-    데이터 정제 및 motion prior 후보값을 만드는 것이 목적이다.
-
-    출력:
-    - dt_total
-    - delta_rotation 벡터 근사값
-    - delta_velocity 근사값
-    - delta_position 근사값
-
-    주의:
-    - 이 값은 아직 bias 보정, 중력 정렬, 카메라-IMU extrinsic 보정을 포함하지 않는다.
-    - 따라서 최종 pose로 강제 적용하면 안 된다.
+    초기 버전은 원본 축 그대로 사용한다.
+    baseline보다 결과가 무너지면 아래 후보처럼 축/부호를 바꿔 실험한다.
+      - return gx, -gy, -gz
+      - return -gy, gx, gz
+      - return gy, -gx, gz
+      - return gx, gz, -gy
     """
+    return gx, gy, gz
 
-    if len(segment) < 2:
+
+def rotvec_to_quat_wxyz(rx: float, ry: float, rz: float) -> Tuple[float, float, float, float]:
+    theta = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if theta < 1e-12:
+        return 1.0, 0.0, 0.0, 0.0
+    ax = rx / theta
+    ay = ry / theta
+    az = rz / theta
+    half = 0.5 * theta
+    s = math.sin(half)
+    return math.cos(half), ax * s, ay * s, az * s
+
+
+def compute_imu_weight(dt: float, imu_count: int, dr_norm_deg: float, has_nan: bool) -> Tuple[float, int, str]:
+    if has_nan:
+        return 0.0, 0, "nan"
+    if imu_count < 2:
+        return 0.0, 0, "too_few_imu"
+    if dt <= 0.0:
+        return 0.0, 0, "bad_dt"
+    if dt > 0.5:
+        return 0.0, 0, "dt_too_large"
+    if dr_norm_deg < 0.05:
+        return 0.0, 0, "too_small_rotation"
+    if dr_norm_deg > 45.0:
+        return 0.0, 0, "too_large_rotation"
+    if dr_norm_deg > 20.0:
+        return 0.0003, 1, "large_but_accepted"
+    return 0.001, 1, "ok"
+
+
+def load_frames(frames_csv: Path) -> List[Dict[str, Any]]:
+    frames: List[Dict[str, Any]] = []
+    with open(frames_csv, "r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            frames.append({
+                "frame_id": int(row["frame_id"]),
+                "frame_index": len(frames),
+                "timestamp_sec": float(row["timestamp_sec"]),
+                "timestamp_ns": int(float(row["timestamp_ns"])),
+                "filename": row.get("filename", f"{len(frames):06d}.jpg"),
+            })
+    frames.sort(key=lambda x: x["timestamp_ns"])
+    return frames
+
+
+def load_imu(imu_csv: Path) -> List[Dict[str, Any]]:
+    samples: List[Dict[str, Any]] = []
+    with open(imu_csv, "r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            gx, gy, gz = convert_gyro_device_to_camera(
+                to_float(row.get("gx")),
+                to_float(row.get("gy")),
+                to_float(row.get("gz")),
+            )
+            samples.append({
+                "timestamp_sec": to_float(row.get("timestamp_sec")),
+                "timestamp_ns": int(float(row.get("timestamp_ns", 0))),
+                "gx": gx,
+                "gy": gy,
+                "gz": gz,
+                "ax": to_float(row.get("ax")),
+                "ay": to_float(row.get("ay")),
+                "az": to_float(row.get("az")),
+            })
+    samples.sort(key=lambda x: x["timestamp_ns"])
+    return samples
+
+
+def integrate_gyro_window(imu_window: List[Dict[str, Any]], start_ns: Optional[int], end_ns: int) -> Dict[str, Any]:
+    if start_ns is None or len(imu_window) < 2:
+        dt = 0.0 if start_ns is None else (end_ns - start_ns) / 1e9
+        dq = rotvec_to_quat_wxyz(0.0, 0.0, 0.0)
         return {
-            "dt": 0.0,
-            "dr_x": 0.0, "dr_y": 0.0, "dr_z": 0.0,
-            "dv_x": 0.0, "dv_y": 0.0, "dv_z": 0.0,
-            "dp_x": 0.0, "dp_y": 0.0, "dp_z": 0.0,
-            "imu_count": len(segment)
+            "dt": dt,
+            "imu_count": len(imu_window),
+            "dr_x": 0.0,
+            "dr_y": 0.0,
+            "dr_z": 0.0,
+            "dr_norm": 0.0,
+            "dr_norm_deg": 0.0,
+            "dq_w": dq[0],
+            "dq_x": dq[1],
+            "dq_y": dq[2],
+            "dq_z": dq[3],
+            "has_nan": False,
         }
 
-    t = segment["timestamp_sec"].to_numpy(dtype=np.float64)
+    dr_x = 0.0
+    dr_y = 0.0
+    dr_z = 0.0
 
-    acc = segment[["acc_x", "acc_y", "acc_z"]].to_numpy(dtype=np.float64)
-    gyro = segment[["gyro_x", "gyro_y", "gyro_z"]].to_numpy(dtype=np.float64)
-
-    dt_array = np.diff(t)
-
-    # 비정상 dt 제거
-    valid = (dt_array > 0.0) & (dt_array < 0.2)
-
-    if valid.sum() == 0:
-        return {
-            "dt": 0.0,
-            "dr_x": 0.0, "dr_y": 0.0, "dr_z": 0.0,
-            "dv_x": 0.0, "dv_y": 0.0, "dv_z": 0.0,
-            "dp_x": 0.0, "dp_y": 0.0, "dp_z": 0.0,
-            "imu_count": len(segment)
-        }
-
-    delta_r = np.zeros(3, dtype=np.float64)
-    delta_v = np.zeros(3, dtype=np.float64)
-    delta_p = np.zeros(3, dtype=np.float64)
-
-    for i, dt in enumerate(dt_array):
-        if not valid[i]:
+    for prev, curr in zip(imu_window[:-1], imu_window[1:]):
+        dt_sample = (curr["timestamp_ns"] - prev["timestamp_ns"]) / 1e9
+        if dt_sample <= 0.0 or dt_sample > 0.2:
             continue
+        gx = 0.5 * (prev["gx"] + curr["gx"])
+        gy = 0.5 * (prev["gy"] + curr["gy"])
+        gz = 0.5 * (prev["gz"] + curr["gz"])
+        dr_x += gx * dt_sample
+        dr_y += gy * dt_sample
+        dr_z += gz * dt_sample
 
-        # 구간 평균값 사용
-        w = 0.5 * (gyro[i] + gyro[i + 1])
-        a = 0.5 * (acc[i] + acc[i + 1])
-
-        # 단순 적분
-        # 현재는 좌표계/중력 보정 전 단계이므로 motion prior 후보값으로만 사용
-        delta_r += w * dt
-        delta_p += delta_v * dt + 0.5 * a * dt * dt
-        delta_v += a * dt
-
-    dt_total = float(np.sum(dt_array[valid]))
+    dr_norm = math.sqrt(dr_x * dr_x + dr_y * dr_y + dr_z * dr_z)
+    dr_norm_deg = math.degrees(dr_norm)
+    dq = rotvec_to_quat_wxyz(dr_x, dr_y, dr_z)
+    values = [dr_x, dr_y, dr_z, dr_norm, dr_norm_deg, *dq]
+    has_nan = any(math.isnan(v) or math.isinf(v) for v in values)
 
     return {
-        "dt": dt_total,
-        "dr_x": float(delta_r[0]),
-        "dr_y": float(delta_r[1]),
-        "dr_z": float(delta_r[2]),
-        "dv_x": float(delta_v[0]),
-        "dv_y": float(delta_v[1]),
-        "dv_z": float(delta_v[2]),
-        "dp_x": float(delta_p[0]),
-        "dp_y": float(delta_p[1]),
-        "dp_z": float(delta_p[2]),
-        "imu_count": int(len(segment))
+        "dt": (end_ns - start_ns) / 1e9,
+        "imu_count": len(imu_window),
+        "dr_x": dr_x,
+        "dr_y": dr_y,
+        "dr_z": dr_z,
+        "dr_norm": dr_norm,
+        "dr_norm_deg": dr_norm_deg,
+        "dq_w": dq[0],
+        "dq_x": dq[1],
+        "dq_y": dq[2],
+        "dq_z": dq[3],
+        "has_nan": has_nan,
     }
 
 
-def build_imu_prior(frames, imu):
-    rows = []
+def build_imu_prior(frames_csv: Path, imu_csv: Path, output_csv: Path) -> Dict[str, Any]:
+    frames = load_frames(frames_csv)
+    imu = load_imu(imu_csv)
+    rows: List[Dict[str, Any]] = []
+    imu_cursor = 0
 
-    for i in range(len(frames)):
-        frame_id = int(frames.loc[i, "frame_id"])
-        timestamp = float(frames.loc[i, "timestamp_sec"])
-        filename = frames.loc[i, "filename"]
+    for i, frame in enumerate(frames):
+        curr_ns = frame["timestamp_ns"]
+        prev_ns = None if i == 0 else frames[i - 1]["timestamp_ns"]
 
-        if i == 0:
-            rows.append({
-                "frame_id": frame_id,
-                "frame_index": i,
-                "timestamp_sec": timestamp,
-                "filename": filename,
-                "prev_timestamp_sec": timestamp,
-                "dt": 0.0,
-                "dr_x": 0.0, "dr_y": 0.0, "dr_z": 0.0,
-                "dv_x": 0.0, "dv_y": 0.0, "dv_z": 0.0,
-                "dp_x": 0.0, "dp_y": 0.0, "dp_z": 0.0,
-                "imu_count": 0
-            })
-            continue
+        if prev_ns is None:
+            imu_window: List[Dict[str, Any]] = []
+        else:
+            while imu_cursor < len(imu) and imu[imu_cursor]["timestamp_ns"] <= prev_ns:
+                imu_cursor += 1
+            j = imu_cursor
+            while j < len(imu) and imu[j]["timestamp_ns"] <= curr_ns:
+                j += 1
+            imu_window = imu[imu_cursor:j]
 
-        prev_t = float(frames.loc[i - 1, "timestamp_sec"])
-        curr_t = timestamp
-
-        segment = imu[
-            (imu["timestamp_sec"] >= prev_t) &
-            (imu["timestamp_sec"] <= curr_t)
-        ].copy()
-
-        integ = integrate_segment(segment)
+        integ = integrate_gyro_window(imu_window, prev_ns, curr_ns)
+        weight, valid, reason = compute_imu_weight(
+            dt=float(integ["dt"]),
+            imu_count=int(integ["imu_count"]),
+            dr_norm_deg=float(integ["dr_norm_deg"]),
+            has_nan=bool(integ["has_nan"]),
+        )
 
         rows.append({
-            "frame_id": frame_id,
+            "frame_id": frame["frame_id"],
             "frame_index": i,
-            "timestamp_sec": curr_t,
-            "filename": filename,
-            "prev_timestamp_sec": prev_t,
-            **integ
+            "timestamp_sec": f"{frame['timestamp_sec']:.9f}",
+            "timestamp_ns": frame["timestamp_ns"],
+            "filename": f"images/{frame['filename']}",
+            "dt": f"{float(integ['dt']):.9f}",
+            "imu_count": integ["imu_count"],
+            "dr_x": f"{float(integ['dr_x']):.12f}",
+            "dr_y": f"{float(integ['dr_y']):.12f}",
+            "dr_z": f"{float(integ['dr_z']):.12f}",
+            "dr_norm": f"{float(integ['dr_norm']):.12f}",
+            "dr_norm_deg": f"{float(integ['dr_norm_deg']):.9f}",
+            "dq_w": f"{float(integ['dq_w']):.12f}",
+            "dq_x": f"{float(integ['dq_x']):.12f}",
+            "dq_y": f"{float(integ['dq_y']):.12f}",
+            "dq_z": f"{float(integ['dq_z']):.12f}",
+            "imu_valid": valid,
+            "imu_weight": f"{weight:.9f}",
+            "invalid_reason": reason,
         })
 
-    return pd.DataFrame(rows)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys()) if rows else [
+        "frame_id", "frame_index", "timestamp_sec", "timestamp_ns", "filename", "dt", "imu_count",
+        "dr_x", "dr_y", "dr_z", "dr_norm", "dr_norm_deg", "dq_w", "dq_x", "dq_y", "dq_z",
+        "imu_valid", "imu_weight", "invalid_reason"
+    ]
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "frame_count": len(frames),
+        "imu_count": len(imu),
+        "prior_rows": len(rows),
+        "valid_rows": sum(1 for r in rows if int(r["imu_valid"]) == 1),
+        "output": str(output_csv),
+    }
 
 
-def print_summary(frames, imu, prior):
-    print("========== IMU PREINTEGRATION SUMMARY ==========")
-    print(f"frames: {len(frames)}")
-    print(f"imu rows after clean: {len(imu)}")
-    print(f"prior rows: {len(prior)}")
-
-    if len(frames) > 0:
-        print(f"frame time range: {frames['timestamp_sec'].min()} ~ {frames['timestamp_sec'].max()}")
-
-    if len(imu) > 0:
-        print(f"imu time range: {imu['timestamp_sec'].min()} ~ {imu['timestamp_sec'].max()}")
-
-    print()
-    print("imu_count per frame interval:")
-    print(prior["imu_count"].describe())
-
-    print("================================================")
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session_dir", required=True)
-    parser.add_argument("--output", default=None)
+    parser.add_argument("--session_dir", type=str, default=None)
+    parser.add_argument("--frames", type=str, default=None)
+    parser.add_argument("--imu", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
-    session_dir = args.session_dir
-    output_path = args.output
+    if args.session_dir:
+        session_dir = Path(args.session_dir)
+        frames_csv = session_dir / "frames.csv"
+        imu_csv = session_dir / "imu.csv"
+        output_csv = Path(args.output) if args.output else session_dir / "imu_prior.csv"
+    else:
+        if not args.frames or not args.imu:
+            raise SystemExit("Use either --session_dir or both --frames and --imu")
+        frames_csv = Path(args.frames)
+        imu_csv = Path(args.imu)
+        output_csv = Path(args.output) if args.output else frames_csv.parent / "imu_prior.csv"
 
-    if output_path is None:
-        output_path = os.path.join(session_dir, "imu_prior.csv")
-
-    frames, imu = load_csv(session_dir)
-    imu = clean_imu(imu)
-
-    prior = build_imu_prior(frames, imu)
-    prior.to_csv(output_path, index=False)
-
-    print_summary(frames, imu, prior)
-    print(f"[OK] saved imu prior: {output_path}")
+    result = build_imu_prior(frames_csv, imu_csv, output_csv)
+    print(result)
 
 
 if __name__ == "__main__":
