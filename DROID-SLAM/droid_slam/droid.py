@@ -97,7 +97,90 @@ def _slerp_identity_xyzw(q, weight):
 
     out = torch.cat([xyz, qw], dim=0)
     return _quat_normalize_xyzw(out)
+# =========================================================
+# IMU adaptive rotation fusion helpers
+# =========================================================
+def _q_normalize_np(q):
+    q = np.asarray(q, dtype=np.float64)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+    return q / n
 
+
+def _q_inv_np(q):
+    q = _q_normalize_np(q)
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
+
+
+def _q_mul_np(q1, q2):
+    """
+    q format: [x, y, z, w]
+    """
+    x1, y1, z1, w1 = _q_normalize_np(q1)
+    x2, y2, z2, w2 = _q_normalize_np(q2)
+
+    return _q_normalize_np(np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dtype=np.float64))
+
+
+def _q_slerp_np(q0, q1, t):
+    """
+    q format: [x, y, z, w]
+    """
+    q0 = _q_normalize_np(q0)
+    q1 = _q_normalize_np(q1)
+    t = float(np.clip(t, 0.0, 1.0))
+
+    dot = float(np.dot(q0, q1))
+
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+
+    if dot > 0.9995:
+        return _q_normalize_np(q0 + t * (q1 - q0))
+
+    theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = np.sin(theta_0)
+
+    theta = theta_0 * t
+    sin_theta = np.sin(theta)
+
+    s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+
+    return _q_normalize_np((s0 * q0) + (s1 * q1))
+
+
+def _q_angle_deg_np(q):
+    """
+    quaternion 회전 크기(deg). q format: [x, y, z, w]
+    """
+    q = _q_normalize_np(q)
+    w = float(np.clip(abs(q[3]), -1.0, 1.0))
+    return float(2.0 * np.arccos(w) * 180.0 / np.pi)
+
+
+def _imu_dq_to_droid_q_np(imu_prior):
+    """
+    imu_prior dq format: [w, x, y, z]
+    DROID pose q format: [x, y, z, w]
+    """
+    dq = imu_prior.get("dq", None)
+
+    if dq is None:
+        return None
+
+    if len(dq) != 4:
+        return None
+
+    w, x, y, z = [float(v) for v in dq]
+    return _q_normalize_np(np.array([x, y, z, w], dtype=np.float64))
 
 class Droid:
     def __init__(self, args):
@@ -160,6 +243,45 @@ class Droid:
             self.net,
             self.video,
         )
+    def _compute_init_imu_weight(self, imu_prior):
+        """
+        Adaptive IMU init rotation weight.
+        Used only before DROID frontend/backend optimization.
+        """
+        if imu_prior is None:
+            return 0.0
+
+        if not bool(imu_prior.get("imu_valid", False)):
+            return 0.0
+
+        dt = float(imu_prior.get("dt", 0.0))
+        imu_count = int(imu_prior.get("imu_count", 0))
+        dr_norm_deg = float(imu_prior.get("dr_norm_deg", 0.0))
+
+        if dt <= 0.0 or dt > 0.35:
+            return 0.0
+
+        if imu_count < 2:
+            return 0.0
+
+        if dr_norm_deg < 0.05:
+            return 0.0
+
+        if dr_norm_deg > 35.0:
+            return 0.0
+
+        max_w = float(getattr(self.args, "imu_adaptive_max_weight", 0.003))
+
+        if dr_norm_deg < 1.0:
+            scale = 0.2
+        elif dr_norm_deg < 3.0:
+            scale = 0.5
+        elif dr_norm_deg < 8.0:
+            scale = 0.8
+        else:
+            scale = 1.0
+
+        return max_w * scale
 
     def load_weights(self, weights):
         """load trained model weights"""
@@ -232,73 +354,75 @@ class Droid:
             return False
 
         return True
-
+    
     def _apply_imu_rotation_init(self, ix, imu_prior):
         """
-        새 frame이 append된 직후, frontend/backend 최적화가 돌기 전에
-        IMU delta rotation을 현재 frame pose 초기값에 약하게 반영한다.
+        Apply IMU preintegrated relative rotation as a weak initialization prior.
 
-        주의:
-        - translation은 절대 건드리지 않는다.
-        - DROID pose를 IMU로 덮어쓰지 않는다.
-        - 이전 pose rotation에 IMU delta rotation을 아주 작게 합성한다.
+        This method does NOT modify DROID backend residuals.
+        It only changes the newly appended frame's initial rotation before
+        frontend/backend optimization.
+
+        pose format:
+            self.video.poses[ix] = [tx, ty, tz, qx, qy, qz, qw]
+
+        imu_prior["dq"] format:
+            [qw, qx, qy, qz]
         """
-        if ix <= 0:
-            return
+        if imu_prior is None:
+            return False
+
+        if getattr(self.args, "imu_mode", "off") != "init_rotation":
+            return False
+
+        if ix is None or ix <= 0:
+            return False
 
         if not self._is_valid_imu_prior(imu_prior):
-            return
-
-        imu_mode = getattr(self.args, "imu_mode", "init_rotation")
-        if imu_mode == "off":
-            return
-
-        if imu_mode != "init_rotation":
-            return
+            return False
 
         device = self.video.poses.device
         dtype = self.video.poses.dtype
 
-        raw_weight = float(imu_prior.get("imu_weight", 0.0))
-
-        # imu_rotation_weight는 전체 gain 역할.
-        # prior 자체의 weight가 0.001이면,
-        # imu_rotation_weight=1.0일 때 0.001만 반영된다.
-        gain = float(getattr(self.args, "imu_rotation_weight", 1.0))
-
-        # 너무 크게 들어가는 것 방지
-        max_weight = float(getattr(self.args, "imu_rotation_weight_max", 0.01))
-        weight = max(0.0, min(raw_weight * gain, max_weight))
-
-        if weight <= 0.0:
-            return
-
         dq_wxyz = imu_prior.get("dq", [1.0, 0.0, 0.0, 0.0])
-
         dq_w = float(dq_wxyz[0])
         dq_x = float(dq_wxyz[1])
         dq_y = float(dq_wxyz[2])
         dq_z = float(dq_wxyz[3])
 
-        # imu_preintegrate.py는 [w, x, y, z]로 저장.
-        # DROID pose는 일반적으로 [tx, ty, tz, qx, qy, qz, qw]라서
-        # quaternion만 [x, y, z, w]로 변환한다.
         dq_xyzw = torch.tensor(
             [dq_x, dq_y, dq_z, dq_w],
             device=device,
             dtype=dtype,
         )
-
         dq_xyzw = _quat_normalize_xyzw(dq_xyzw)
 
-        # IMU 회전을 그대로 쓰지 말고 작은 비율만 적용
+        # ---------------------------------------------------------
+        # Weight selection
+        # ---------------------------------------------------------
+        raw_weight = float(imu_prior.get("imu_weight", 0.0))
+        gain = float(getattr(self.args, "imu_rotation_weight", 1.0))
+        weight_max = float(getattr(self.args, "imu_rotation_weight_max", 0.01))
+
+        weight = min(raw_weight * gain, weight_max)
+
+        # Adaptive init mode:
+        # use frame-wise IMU quality / rotation magnitude to change weight.
+        if getattr(self.args, "imu_adaptive_init", False):
+            weight = self._compute_init_imu_weight(imu_prior)
+
+        weight = float(np.clip(weight, 0.0, weight_max if not getattr(self.args, "imu_adaptive_init", False) else 1.0))
+
+        if weight <= 0.0:
+            return False
+
+        # Only apply a tiny fraction of the IMU relative rotation.
         dq_small = _slerp_identity_xyzw(dq_xyzw, weight)
 
         prev_pose = self.video.poses[ix - 1].clone()
         cur_pose = self.video.poses[ix].clone()
 
-        prev_q = prev_pose[3:7].clone()
-        prev_q = _quat_normalize_xyzw(prev_q)
+        prev_q = _quat_normalize_xyzw(prev_pose[3:7].clone())
 
         compose_order = getattr(self.args, "imu_compose_order", "prev_dq")
 
@@ -307,36 +431,41 @@ class Droid:
         else:
             pred_q = _quat_mul_xyzw(prev_q, dq_small)
 
-        # translation은 기존 DROID 초기값 유지
-        cur_pose[3:7] = pred_q
-
+        # Keep DROID translation/depth initialization.
+        # Change only the rotation initialization of the newly appended frame.
+        cur_pose[3:7] = _quat_normalize_xyzw(pred_q)
         self.video.poses[ix] = cur_pose
 
         if bool(getattr(self.args, "imu_debug", False)):
             print(
                 "[IMU] init_rotation "
                 f"frame={ix}, "
+                f"adaptive={bool(getattr(self.args, 'imu_adaptive_init', False))}, "
                 f"raw_weight={raw_weight:.8f}, "
                 f"gain={gain:.4f}, "
+                f"weight_max={weight_max:.8f}, "
                 f"used_weight={weight:.8f}, "
                 f"dr_norm_deg={float(imu_prior.get('dr_norm_deg', 0.0)):.4f}, "
                 f"imu_count={int(imu_prior.get('imu_count', 0))}, "
-                f"dt={float(imu_prior.get('dt', 0.0)):.4f}"
+                f"dt={float(imu_prior.get('dt', 0.0)):.4f}, "
+                f"compose_order={compose_order}",
+                flush=True,
             )
+
+        return True
 
     def track(self, tstamp, image, depth=None, intrinsics=None, imu_prior=None):
         """
         main thread - update map
 
         변경점:
-        - MotionFilter에는 IMU를 넘기지 않는다.
-        - frame이 실제 append된 경우에만 IMU rotation prior를 적용한다.
-        - 적용 위치는 frontend/backend 최적화 전이다.
+        - frame append 직후 IMU rotation prior를 초기 pose에 약하게 반영
+        - backend/post-correction은 사용하지 않음
         """
+
         with torch.no_grad():
             before_counter = self.video.counter.value
 
-            # 원본 DROID-SLAM 흐름 유지
             self.filterx.track(
                 tstamp,
                 image,
@@ -346,9 +475,13 @@ class Droid:
 
             after_counter = self.video.counter.value
 
-            # MotionFilter가 frame을 실제로 append한 경우에만 적용
-            if after_counter > before_counter:
-                ix = after_counter - 1
+            appended = after_counter > before_counter
+            ix = after_counter - 1 if appended else None
+
+            # Apply IMU only as a weak initialization prior.
+            # Do NOT use rotation post-correction here; post-correction can
+            # break DROID pose-depth consistency and tear the point cloud.
+            if appended and imu_prior is not None:
                 self._apply_imu_rotation_init(ix, imu_prior)
 
             counter = self.video.counter.value
@@ -365,7 +498,7 @@ class Droid:
 
             if self.visualizer is not None:
                 self.visualizer()
-
+                
     def terminate(self, stream=None):
         """terminate the visualization process, return poses [t, q]"""
 
